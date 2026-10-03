@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Messagerie Instantanée</title>
+  <link rel="stylesheet" href="css/style.css">
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="js/theme.js"></script>
+</head>
+<body>
+  <div class="app-layout" id="appLayout">
+    <!-- COLONNE GAUCHE : Barre latérale des conversations & contacts -->
+    <aside class="sidebar" id="sidebar">
+      <header class="sidebar-header">
+        <div class="current-user-info">
+          <div class="avatar" id="currentUserAvatar">U</div>
+          <div class="user-details">
+            <span class="user-name" id="currentUsername">Chargement...</span>
+            <span class="user-status-pill online">
+              <span class="status-dot"></span> Connecté
+            </span>
+          </div>
+        </div>
+        <div class="header-actions">
+          <button type="button" class="icon-btn theme-toggle-btn" title="Changer de thème">
+            🌙
+          </button>
+          <button type="button" class="icon-btn logout-btn" id="logoutBtn" title="Se déconnecter">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path>
+              <polyline points="16 17 21 12 16 7"></polyline>
+              <line x1="21" y1="12" x2="9" y2="12"></line>
+            </svg>
+          </button>
+        </div>
+      </header>
+
+      <!-- Barre de recherche -->
+      <div class="search-bar-container">
+        <div class="search-input-wrapper">
+          <svg class="search-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="11" cy="11" r="8"></circle>
+            <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+          </svg>
+          <input 
+            type="text" 
+            id="searchInput" 
+            placeholder="Rechercher ou démarrer un chat..." 
+            autocomplete="off"
+          >
+          <button type="button" id="clearSearchBtn" class="clear-search-btn" style="display: none;" title="Effacer la recherche">
+            &times;
+          </button>
+        </div>
+      </div>
+
+      <!-- Navigation d'onglets de la barre latérale -->
+      <div class="sidebar-tabs">
+        <button type="button" class="sidebar-tab active" id="tabConversations">Discussions</button>
+        <button type="button" class="sidebar-tab" id="tabAllUsers">Annuaire</button>
+      </div>
+
+      <!-- Liste déroulante des conversations -->
+      <div class="conversations-list" id="conversationsList">
+        <div class="list-placeholder">Chargement de vos conversations...</div>
+      </div>
+    </aside>
+
+    <!-- COLONNE DROITE : Zone de messagerie -->
+    <main class="chat-panel" id="chatPanel">
+      <!-- État vide (aucun chat sélectionné) -->
+      <div class="empty-chat-state" id="emptyChatState">
+        <div class="empty-icon-wrapper">
+          <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
+          </svg>
+        </div>
+        <h2>Messagerie Instantanée</h2>
+        <p>Sélectionnez un contact dans la liste à gauche ou recherchez un utilisateur pour démarrer une conversation privée.</p>
+        <div class="encryption-badge">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
+            <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+          </svg>
+          Messagerie en temps réel par WebSockets (Socket.io)
+        </div>
+      </div>
+
+      <!-- Chat actif -->
+      <div class="active-chat-wrapper" id="activeChatWrapper" style="display: none;">
+        <!-- En-tête du chat -->
+        <header class="chat-header">
+          <button type="button" class="back-btn" id="backToListBtn" title="Retour aux conversations">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="19" y1="12" x2="5" y2="12"></line>
+              <polyline points="12 19 5 12 12 5"></polyline>
+            </svg>
+          </button>
+          
+          <div class="contact-info">
+            <div class="avatar contact-avatar" id="activeContactAvatar">
+              <span>C</span>
+              <span class="online-indicator-badge" id="activeContactStatusBadge"></span>
+            </div>
+            <div class="contact-text">
+              <h3 class="contact-name" id="activeContactName">Nom d'utilisateur</h3>
+              <p class="contact-status" id="activeContactStatus">Hors ligne</p>
+            </div>
+          </div>
+        </header>
+
+        <!-- Corps des messages -->
+        <div class="chat-messages" id="chatMessages">
+          <!-- Les bulles de messages seront injectées dynamiquement ici -->
+        </div>
+
+        <!-- Indicateur "en train d'écrire..." flottant -->
+        <div class="typing-indicator-container" id="typingIndicator" style="display: none;">
+          <div class="typing-bubble">
+            <span class="typing-text" id="typingText">écrit</span>
+            <span class="dot"></span>
+            <span class="dot"></span>
+            <span class="dot"></span>
+          </div>
+        </div>
+
+        <!-- Zone de saisie et envoi -->
+        <footer class="chat-input-bar">
+          <form id="messageForm" class="message-form" autocomplete="off">
+            <input 
+              type="text" 
+              id="messageInput" 
+              placeholder="Écrivez un message..." 
+              maxlength="3000"
+              autocomplete="off"
+            >
+            <button type="submit" id="sendBtn" class="send-btn" title="Envoyer le message" aria-label="Envoyer">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <line x1="22" y1="2" x2="11" y2="13"></line>
+                <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+              </svg>
+            </button>
+          </form>
+        </footer>
+      </div>
+    </main>
+  </div>
+
+  <script src="js/app.js"></script>
+</body>
+</html>

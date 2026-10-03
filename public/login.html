@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Connexion & Inscription | Messagerie Instantanée</title>
+  <link rel="stylesheet" href="css/auth.css">
+  <script src="js/theme.js"></script>
+</head>
+<body>
+  <div class="top-bar">
+    <button type="button" class="theme-toggle-btn" aria-label="Basculer le thème">
+      🌙 <span>Sombre</span>
+    </button>
+  </div>
+
+  <main class="auth-container">
+    <header class="brand-header">
+      <div class="brand-icon">
+        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
+        </svg>
+      </div>
+      <h1>Messagerie Instantanée</h1>
+      <p id="authSubtitle">Connectez-vous pour échanger en direct</p>
+    </header>
+
+    <div class="auth-tabs" role="tablist">
+      <button type="button" class="tab-btn active" id="tabLogin" role="tab" aria-selected="true">Connexion</button>
+      <button type="button" class="tab-btn" id="tabRegister" role="tab" aria-selected="false">Inscription</button>
+    </div>
+
+    <div id="alertBox" class="alert-box" role="alert"></div>
+
+    <form id="authForm" class="auth-form" novalidate>
+      <div class="form-group">
+        <label for="username">Nom d'utilisateur</label>
+        <input 
+          type="text" 
+          id="username" 
+          name="username" 
+          placeholder="Ex: alex_dev" 
+          required 
+          autocomplete="username"
+          minlength="3"
+          maxlength="20"
+        >
+        <span class="helper-text" id="usernameHelper">3 à 20 caractères (lettres, chiffres, _ ou -)</span>
+      </div>
+
+      <div class="form-group">
+        <label for="password">Mot de passe</label>
+        <input 
+          type="password" 
+          id="password" 
+          name="password" 
+          placeholder="••••••••" 
+          required 
+          autocomplete="current-password"
+          minlength="6"
+        >
+        <span class="helper-text" id="passwordHelper">Au moins 6 caractères</span>
+      </div>
+
+      <button type="submit" class="submit-btn" id="submitBtn">
+        <span id="btnText">Se connecter</span>
+      </button>
+    </form>
+
+    <footer class="auth-footer">
+      <p>Messagerie temps réel sécurisée &bull; Protégée par JWT & bcrypt</p>
+    </footer>
+  </main>
+
+  <script src="js/auth.js"></script>
+</body>
+</html>
