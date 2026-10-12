@@ -27,6 +27,7 @@ const io = new Server(server, {
     credentials: true
   }
 });
+app.set('io', io);
 
 // Middleware standard
 app.use(express.json({ limit: '1mb' }));

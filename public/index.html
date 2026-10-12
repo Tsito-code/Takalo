@@ -23,6 +23,12 @@
           </div>
         </div>
         <div class="header-actions">
+          <button type="button" class="icon-btn notif-btn" id="notifPermissionBtn" title="Activer les notifications du navigateur" style="display: none;">
+            🔔
+          </button>
+          <button type="button" class="icon-btn sound-btn" id="soundToggleBtn" title="Activer / couper le son">
+            🔊
+          </button>
           <button type="button" class="icon-btn theme-toggle-btn" title="Changer de thème">
             🌙
           </button>
@@ -144,8 +150,10 @@
           </form>
         </footer>
       </div>
-    </main>
   </div>
+
+  <!-- Conteneur des notifications toast (empilement max 3) -->
+  <div class="toast-container" id="toastContainer" aria-live="polite" aria-atomic="true"></div>
 
   <script src="js/app.js"></script>
 </body>

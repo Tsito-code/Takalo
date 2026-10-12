@@ -1,7 +1,8 @@
 /**
  * Application principale de Messagerie Instantanée Frontend
  * Vanilla JavaScript (sans framework)
- * Gestion de l'état, de Socket.io, du DOM et des événements
+ * Gestion du temps réel (Socket.io), affichage optimiste, suppression de messages,
+ * notifications (toast, son Web Audio, notification navigateur) et mise à jour dynamique.
  */
 
 (function () {
@@ -16,12 +17,17 @@
   let socket = null;
   let typingTimer = null;
   let isCurrentlyTyping = false;
+  let hasConnectedOnce = false;
+  let lastKnownMessageId = 0;
+  let soundEnabled = localStorage.getItem('chat_sound_enabled') !== 'false'; // Activé par défaut
 
   // --- Références DOM ---
   const appLayout = document.getElementById('appLayout');
   const currentUserAvatar = document.getElementById('currentUserAvatar');
   const currentUsername = document.getElementById('currentUsername');
   const logoutBtn = document.getElementById('logoutBtn');
+  const soundToggleBtn = document.getElementById('soundToggleBtn');
+  const notifPermissionBtn = document.getElementById('notifPermissionBtn');
   const searchInput = document.getElementById('searchInput');
   const clearSearchBtn = document.getElementById('clearSearchBtn');
   const tabConversations = document.getElementById('tabConversations');
@@ -40,21 +46,9 @@
   const typingText = document.getElementById('typingText');
   const messageForm = document.getElementById('messageForm');
   const messageInput = document.getElementById('messageInput');
+  const toastContainer = document.getElementById('toastContainer');
 
-  // --- Fonctions utilitaires ---
-
-  /**
-   * Sécurisation : échappement des chaînes de caractères si nécessaire
-   */
-  function escapeHTML(str) {
-    if (!str) return '';
-    return str
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;')
-      .replace(/'/g, '&#039;');
-  }
+  // --- Fonctions Utilitaires & Audio ---
 
   /**
    * Obtient les initiales d'un nom d'utilisateur pour l'avatar
@@ -74,9 +68,6 @@
     return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   }
 
-  /**
-   * Formate une date pour le séparateur de discussion (Aujourd'hui, Hier, ou Date)
-   */
   function formatDateKey(dateString) {
     if (!dateString) return '';
     const date = new Date(dateString);
@@ -99,7 +90,16 @@
   }
 
   /**
-   * Scroll automatique vers le bas de la discussion
+   * Vérifie si l'utilisateur est positionné tout en bas du fil de discussion
+   */
+  function isUserScrolledToBottom() {
+    if (!chatMessages) return true;
+    const threshold = 60; // Marge de tolérance en pixels
+    return (chatMessages.scrollHeight - chatMessages.scrollTop - chatMessages.clientHeight) <= threshold;
+  }
+
+  /**
+   * Défilement vers le bas de la discussion
    */
   function scrollToBottom(smooth = false) {
     if (!chatMessages) return;
@@ -107,6 +107,182 @@
       chatMessages.scrollTo({ top: chatMessages.scrollHeight, behavior: 'smooth' });
     } else {
       chatMessages.scrollTop = chatMessages.scrollHeight;
+    }
+  }
+
+  /**
+   * Générateur de signal sonore discret via la Web Audio API (sans fichier externe)
+   */
+  function playNotificationSound() {
+    if (!soundEnabled) return;
+    try {
+      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+      if (!AudioContextClass) return;
+      const ctx = new AudioContextClass();
+
+      const now = ctx.currentTime;
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+
+      osc.type = 'sine';
+      // Bip doux en deux notes harmonieuses (D5 -> A5)
+      osc.frequency.setValueAtTime(587.33, now);
+      osc.frequency.setValueAtTime(880.00, now + 0.08);
+
+      gain.gain.setValueAtTime(0.12, now);
+      gain.gain.exponentialRampToValueAtTime(0.001, now + 0.28);
+
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+
+      osc.start(now);
+      osc.stop(now + 0.28);
+    } catch (e) {
+      // Ignorer si les politiques d'autoplay du navigateur bloquent l'audio
+    }
+  }
+
+  /**
+   * Met à jour le titre de l'onglet du navigateur avec le compteur de non-lus
+   */
+  function updateTabTitle() {
+    let totalUnread = 0;
+    conversationsMap.forEach(conv => {
+      totalUnread += (conv.unread_count || 0);
+    });
+
+    if (totalUnread > 0) {
+      document.title = `(${totalUnread}) Messagerie Instantanée`;
+    } else {
+      document.title = 'Messagerie Instantanée';
+    }
+  }
+
+  // --- Système de Notifications (Toast, Navigateur) ---
+
+  /**
+   * Initialisation des contrôles de notification et son dans le header
+   */
+  function initNotificationControls() {
+    // Bouton de son
+    updateSoundButtonUI();
+    soundToggleBtn.addEventListener('click', () => {
+      soundEnabled = !soundEnabled;
+      localStorage.setItem('chat_sound_enabled', soundEnabled);
+      updateSoundButtonUI();
+    });
+
+    // Bouton de permission de notification système
+    if ('Notification' in window) {
+      if (Notification.permission === 'default') {
+        notifPermissionBtn.style.display = 'flex';
+        notifPermissionBtn.addEventListener('click', async () => {
+          const perm = await Notification.requestPermission();
+          if (perm !== 'default') {
+            notifPermissionBtn.style.display = 'none';
+          }
+        });
+      } else {
+        notifPermissionBtn.style.display = 'none';
+      }
+    }
+  }
+
+  function updateSoundButtonUI() {
+    if (soundEnabled) {
+      soundToggleBtn.textContent = '🔊';
+      soundToggleBtn.title = 'Couper le son des notifications';
+    } else {
+      soundToggleBtn.textContent = '🔇';
+      soundToggleBtn.title = 'Activer le son des notifications';
+    }
+  }
+
+  /**
+   * Affiche une bannière toast en haut de l'écran (empilement max 3)
+   */
+  function showToastNotification(senderId, senderName, messageText) {
+    if (!toastContainer) return;
+
+    // Limiter à maximum 3 notifications visibles simultanément
+    const existingToasts = toastContainer.querySelectorAll('.toast-item');
+    if (existingToasts.length >= 3) {
+      existingToasts[0].remove();
+    }
+
+    const toast = document.createElement('div');
+    toast.className = 'toast-item';
+    toast.role = 'alert';
+
+    const contentDiv = document.createElement('div');
+    contentDiv.className = 'toast-content';
+
+    const senderDiv = document.createElement('div');
+    senderDiv.className = 'toast-sender';
+    senderDiv.textContent = senderName || 'Nouveau message';
+
+    const messageDiv = document.createElement('div');
+    messageDiv.className = 'toast-message';
+    // Tronquer à environ 60 caractères
+    const truncated = messageText.length > 60 ? messageText.slice(0, 60) + '...' : messageText;
+    messageDiv.textContent = truncated; // Sécurité XSS garantie avec textContent
+
+    contentDiv.appendChild(senderDiv);
+    contentDiv.appendChild(messageDiv);
+
+    const closeBtn = document.createElement('button');
+    closeBtn.type = 'button';
+    closeBtn.className = 'toast-close';
+    closeBtn.innerHTML = '&times;';
+    closeBtn.title = 'Fermer';
+
+    toast.appendChild(contentDiv);
+    toast.appendChild(closeBtn);
+
+    // Clic sur la notification : ouvrir directement la conversation
+    toast.addEventListener('click', (e) => {
+      if (e.target === closeBtn) return;
+      toast.remove();
+      openChat({ id: senderId, username: senderName });
+    });
+
+    // Fermeture manuelle
+    closeBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      toast.classList.add('hide');
+      setTimeout(() => toast.remove(), 200);
+    });
+
+    toastContainer.appendChild(toast);
+
+    // Disparition automatique après 4 secondes
+    setTimeout(() => {
+      if (toast.parentElement) {
+        toast.classList.add('hide');
+        setTimeout(() => toast.remove(), 200);
+      }
+    }, 4000);
+  }
+
+  /**
+   * Déclenche une notification système du navigateur si l'onglet est en arrière-plan
+   */
+  function triggerBrowserNotification(senderName, messageText) {
+    if (document.hidden && 'Notification' in window && Notification.permission === 'granted') {
+      try {
+        const truncated = messageText.length > 80 ? messageText.slice(0, 80) + '...' : messageText;
+        const notif = new Notification(senderName, {
+          body: truncated,
+          icon: '/favicon.ico',
+          tag: 'msg_' + Date.now()
+        });
+        notif.onclick = () => {
+          window.focus();
+          notif.close();
+        };
+      } catch (e) {
+        // Ignorer en cas d'erreur de permission contextuelle
+      }
     }
   }
 
@@ -126,6 +302,9 @@
       // Affichage du profil utilisateur
       currentUsername.textContent = currentUser.username;
       currentUserAvatar.textContent = getInitials(currentUser.username);
+
+      // Initialiser les notifications
+      initNotificationControls();
 
       // Initialiser la connexion Socket.io
       initSocketConnection();
@@ -153,7 +332,17 @@
     }
   });
 
-  // --- Socket.io ---
+  // Remise à zéro / synchronisation du titre au focus
+  window.addEventListener('focus', () => {
+    updateTabTitle();
+  });
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) {
+      updateTabTitle();
+    }
+  });
+
+  // --- Socket.io & Gestion Réseau ---
 
   function initSocketConnection() {
     socket = io({
@@ -163,6 +352,12 @@
 
     socket.on('connect', () => {
       console.log('Connecté au serveur Socket.io');
+
+      // Gestion de la reconnexion automatique : récupérer les messages manqués
+      if (hasConnectedOnce && lastKnownMessageId > 0) {
+        syncMissedMessages(lastKnownMessageId);
+      }
+      hasConnectedOnce = true;
     });
 
     // Réception initiale de tous les utilisateurs en ligne
@@ -196,11 +391,12 @@
 
     // Confirmation d'envoi de son propre message
     socket.on('message_sent', (message) => {
-      if (activeContact && (message.receiver_id === activeContact.id || message.sender_id === activeContact.id)) {
-        appendMessageBubble(message);
-        scrollToBottom(true);
-      }
-      updateConversationWithNewMessage(message, message.receiver_id);
+      handleMessageConfirmation(message);
+    });
+
+    // Suppression d'un message en temps réel
+    socket.on('message:deleted', (data) => {
+      handleMessageDeleted(data);
     });
 
     // Indicateur d'écriture reçu
@@ -210,7 +406,9 @@
         typingIndicator.style.display = 'block';
         activeContactStatus.textContent = 'est en train d’écrire...';
         activeContactStatus.classList.add('typing');
-        scrollToBottom(true);
+        if (isUserScrolledToBottom()) {
+          scrollToBottom(true);
+        }
       }
 
       // Indicateur dans la barre latérale
@@ -245,8 +443,7 @@
     // Confirmation que le destinataire a lu nos messages
     socket.on('messages_read_by_recipient', (data) => {
       if (activeContact && activeContact.id === data.readerId) {
-        // Mettre à jour les coches de statut des messages envoyés dans la vue
-        document.querySelectorAll('.message-bubble-wrapper.sent .message-status-icon').forEach(icon => {
+        document.querySelectorAll('.message-bubble-wrapper.sent:not(.deleted) .message-status-icon').forEach(icon => {
           icon.classList.add('read');
           icon.innerHTML = getDoubleCheckSvg(true);
         });
@@ -254,49 +451,199 @@
     });
   }
 
+  // --- Récupération des messages manqués lors d'une reconnexion ---
+
+  async function syncMissedMessages(sinceId) {
+    try {
+      const res = await fetch(`/api/messages/sync?sinceId=${sinceId}`);
+      if (!res.ok) return;
+      const data = await res.json();
+      const missed = data.messages || [];
+
+      missed.forEach(msg => {
+        if (msg.sender_id !== currentUser.id) {
+          handleIncomingMessage(msg, false); // sans rejouer les sons en rafale
+        }
+      });
+
+      // Rafraîchir les conversations
+      await loadConversations();
+    } catch (err) {
+      console.error('Erreur synchronisation après reconnexion :', err);
+    }
+  }
+
   // --- Gestion des messages entrants ---
 
-  function handleIncomingMessage(message) {
+  function handleIncomingMessage(message, playAlerts = true) {
+    // Éviter les doublons de messages
+    if (message.id) {
+      lastKnownMessageId = Math.max(lastKnownMessageId, message.id);
+      if (document.querySelector(`.message-bubble-wrapper[data-msg-id="${message.id}"]`)) {
+        return; // Message déjà présent dans le DOM
+      }
+    }
+
     const senderId = message.sender_id;
+    const isCurrentChatOpen = activeContact && activeContact.id === senderId;
 
-    // Si la conversation avec cet utilisateur est actuellement ouverte
-    if (activeContact && activeContact.id === senderId) {
+    if (isCurrentChatOpen) {
+      // Défilement automatique vers le bas uniquement si l'utilisateur est déjà en bas
+      const wasAtBottom = isUserScrolledToBottom();
+
       appendMessageBubble(message);
-      scrollToBottom(true);
 
-      // Marquer automatiquement comme lu auprès du serveur
+      if (wasAtBottom) {
+        scrollToBottom(true);
+      }
+
+      // Marquer comme lu
       socket.emit('mark_read', { senderId });
       fetch(`/api/messages/${senderId}/read`, { method: 'POST' });
 
-      // Mettre à jour l'aperçu sans incrémenter de badge non lu
+      // Mettre à jour l'aperçu sans incrémenter le badge
       updateConversationWithNewMessage(message, senderId, false);
+
+      // Si l'onglet est en arrière-plan, notifier le navigateur
+      if (playAlerts && document.hidden) {
+        triggerBrowserNotification(message.sender_username || 'Nouveau message', message.content || '');
+      }
     } else {
-      // Si la conversation n'est pas ouverte, incrémenter le badge non-lu
+      // Conversation fermée ou autre conversation ouverte :
+      // 1. Incrémenter le compteur de non-lus
+      // 2. Remonter la conversation en haut de liste
       updateConversationWithNewMessage(message, senderId, true);
+
+      // 3. Déclencher les alertes si permis
+      if (playAlerts) {
+        playNotificationSound();
+        showToastNotification(senderId, message.sender_username || 'Utilisateur', message.content || '');
+        triggerBrowserNotification(message.sender_username || 'Nouveau message', message.content || '');
+      }
+    }
+
+    updateTabTitle();
+  }
+
+  function handleMessageConfirmation(message) {
+    if (message.id) {
+      lastKnownMessageId = Math.max(lastKnownMessageId, message.id);
+    }
+
+    const targetContactId = message.receiver_id === currentUser.id ? message.sender_id : message.receiver_id;
+
+    if (activeContact && (targetContactId === activeContact.id)) {
+      // Si on avait un message optimiste avec tempId
+      if (message.tempId) {
+        const optimisticBubble = document.querySelector(`.message-bubble-wrapper[data-msg-id="${message.tempId}"]`);
+        if (optimisticBubble) {
+          optimisticBubble.dataset.msgId = message.id;
+          optimisticBubble.classList.remove('optimistic');
+          const timeSpan = optimisticBubble.querySelector('.message-time');
+          if (timeSpan) timeSpan.textContent = formatTime(message.created_at);
+
+          const statusSpan = optimisticBubble.querySelector('.message-meta span:last-child');
+          if (statusSpan) statusSpan.innerHTML = getDoubleCheckSvg(Boolean(message.is_read));
+
+          // Mettre à jour le bouton de suppression avec le vrai ID
+          const delBtn = optimisticBubble.querySelector('.message-delete-btn');
+          if (delBtn) {
+            delBtn.onclick = () => confirmDeleteMessage(message.id);
+          }
+          return;
+        }
+      }
+
+      // Si pas encore dans le DOM (ex: second onglet de l'expéditeur)
+      if (!document.querySelector(`.message-bubble-wrapper[data-msg-id="${message.id}"]`)) {
+        appendMessageBubble(message);
+        scrollToBottom(true);
+      }
+    }
+
+    updateConversationWithNewMessage(message, targetContactId, false);
+  }
+
+  // --- Suppression en temps réel ---
+
+  function handleMessageDeleted(data) {
+    const messageId = data.id;
+
+    // Rechercher la bulle de message dans la vue active
+    const bubbleWrapper = document.querySelector(`.message-bubble-wrapper[data-msg-id="${messageId}"]`);
+    if (bubbleWrapper) {
+      const bubble = bubbleWrapper.querySelector('.message-bubble');
+      if (bubble) {
+        bubble.classList.add('deleted');
+        const textP = bubble.querySelector('.message-text');
+        if (textP) textP.textContent = 'Ce message a été supprimé';
+
+        // Retirer les coches et le bouton de suppression
+        const meta = bubble.querySelector('.message-meta');
+        if (meta) {
+          const statusIcon = meta.querySelector('.message-status-icon');
+          if (statusIcon) statusIcon.remove();
+        }
+        const delBtn = bubbleWrapper.querySelector('.message-delete-btn');
+        if (delBtn) delBtn.remove();
+      }
+    }
+
+    // Mettre à jour l'aperçu de la conversation dans la barre latérale si nécessaire
+    const contactId = data.senderId === currentUser.id ? data.receiverId : data.senderId;
+    const conv = conversationsMap.get(contactId);
+    if (conv) {
+      // Recharger les conversations pour rafraîchir le dernier message exact
+      loadConversations();
+    }
+  }
+
+  async function confirmDeleteMessage(messageId) {
+    if (!confirm('Voulez-vous vraiment supprimer ce message pour tout le monde ?')) {
+      return;
+    }
+
+    try {
+      if (socket && socket.connected) {
+        socket.emit('delete_message', { messageId }, (res) => {
+          if (res && res.error) {
+            alert(res.error);
+          }
+        });
+      } else {
+        const response = await fetch(`/api/messages/${messageId}`, { method: 'DELETE' });
+        const result = await response.json();
+        if (!response.ok) {
+          alert(result.error || 'Erreur lors de la suppression.');
+        }
+      }
+    } catch (err) {
+      console.error('Erreur suppression :', err);
+      alert('Impossible de contacter le serveur.');
     }
   }
 
   function updateConversationWithNewMessage(message, contactId, incrementUnread = false) {
     let conv = conversationsMap.get(contactId);
 
+    const displayContent = message.is_deleted ? 'Ce message a été supprimé' : message.content;
+
     if (conv) {
-      conv.last_message = message.content;
+      conv.last_message = displayContent;
       conv.last_message_time = message.created_at;
       conv.last_sender_id = message.sender_id;
       if (incrementUnread) {
         conv.unread_count = (conv.unread_count || 0) + 1;
       }
     } else {
-      // Nouvelle conversation non répertoriée
       conv = {
         user_id: contactId,
-        username: 'Utilisateur',
-        last_message: message.content,
+        username: message.sender_username || 'Utilisateur',
+        last_message: displayContent,
         last_message_time: message.created_at,
         last_sender_id: message.sender_id,
         unread_count: incrementUnread ? 1 : 0
       };
-      // Charger le nom d'utilisateur si absent
       fetch(`/api/users/${contactId}`)
         .then(r => r.json())
         .then(d => {
@@ -309,10 +656,10 @@
 
     conversationsMap.set(contactId, conv);
 
-    // Si on est sur l'onglet conversations, réordonner la liste
     if (currentTab === 'conversations') {
       renderConversationsList();
     }
+    updateTabTitle();
   }
 
   // --- Chargement des données REST ---
@@ -328,6 +675,7 @@
       });
 
       renderConversationsList();
+      updateTabTitle();
     } catch (err) {
       console.error('Erreur chargement conversations :', err);
       conversationsList.innerHTML = '<div class="list-placeholder">Erreur de chargement.</div>';
@@ -542,12 +890,11 @@
   async function openChat(contact) {
     activeContact = contact;
 
-    // Reset des badges d'éléments actifs dans la sidebar
+    // Reset des classes actives dans la sidebar
     document.querySelectorAll('.conversation-item').forEach(el => el.classList.remove('active'));
     const activeItem = document.querySelector(`.conversation-item[data-user-id="${contact.id}"]`);
     if (activeItem) {
       activeItem.classList.add('active');
-      // Effacer le badge non lu localement
       const badge = activeItem.querySelector('.unread-badge');
       if (badge) badge.remove();
     }
@@ -557,8 +904,9 @@
     if (conv) {
       conv.unread_count = 0;
     }
+    updateTabTitle();
 
-    // Afficher le chat et cacher l'état vide
+    // Afficher le chat et masquer l'état vide
     emptyChatState.style.display = 'none';
     activeChatWrapper.style.display = 'flex';
 
@@ -590,6 +938,9 @@
         let lastDateKey = null;
 
         data.messages.forEach(msg => {
+          if (msg.id) {
+            lastKnownMessageId = Math.max(lastKnownMessageId, msg.id);
+          }
           const msgDateKey = formatDateKey(msg.created_at);
           if (msgDateKey && msgDateKey !== lastDateKey) {
             appendDateDivider(msg.created_at);
@@ -610,7 +961,6 @@
       chatMessages.innerHTML = '<div class="list-placeholder">Erreur lors du chargement des messages.</div>';
     }
 
-    // Focus sur le champ de saisie
     messageInput.focus();
   }
 
@@ -633,17 +983,22 @@
 
   function appendMessageBubble(msg) {
     const isSent = msg.sender_id === currentUser.id;
+    const isDeleted = Boolean(msg.is_deleted);
+    const isOptimistic = Boolean(msg.is_optimistic);
 
     const wrapper = document.createElement('div');
-    wrapper.className = `message-bubble-wrapper ${isSent ? 'sent' : 'received'}`;
+    wrapper.className = `message-bubble-wrapper ${isSent ? 'sent' : 'received'} ${isOptimistic ? 'optimistic' : ''}`;
     wrapper.dataset.msgId = msg.id;
 
+    const row = document.createElement('div');
+    row.className = 'message-row';
+
     const bubble = document.createElement('div');
-    bubble.className = 'message-bubble';
+    bubble.className = `message-bubble ${isDeleted ? 'deleted' : ''}`;
 
     const textP = document.createElement('p');
     textP.className = 'message-text';
-    textP.textContent = msg.content; // textContent empêche toute injection XSS
+    textP.textContent = isDeleted ? 'Ce message a été supprimé' : msg.content; // 100% protégé XSS
 
     const metaDiv = document.createElement('div');
     metaDiv.className = 'message-meta';
@@ -654,22 +1009,60 @@
 
     metaDiv.appendChild(timeSpan);
 
-    if (isSent) {
+    if (isSent && !isDeleted) {
       const statusSpan = document.createElement('span');
-      statusSpan.innerHTML = getDoubleCheckSvg(Boolean(msg.is_read));
+      if (isOptimistic) {
+        statusSpan.className = 'optimistic-indicator';
+        statusSpan.textContent = '🕒';
+      } else {
+        statusSpan.innerHTML = getDoubleCheckSvg(Boolean(msg.is_read));
+      }
       metaDiv.appendChild(statusSpan);
     }
 
     bubble.appendChild(textP);
     bubble.appendChild(metaDiv);
-    wrapper.appendChild(bubble);
+    row.appendChild(bubble);
 
+    // Bouton de suppression : uniquement sur MES messages non supprimés
+    if (isSent && !isDeleted) {
+      const delBtn = document.createElement('button');
+      delBtn.type = 'button';
+      delBtn.className = 'message-delete-btn';
+      delBtn.title = 'Supprimer ce message';
+      delBtn.setAttribute('aria-label', 'Supprimer ce message');
+      delBtn.innerHTML = `
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="3 6 5 6 21 6"></polyline>
+          <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+          <line x1="10" y1="11" x2="10" y2="17"></line>
+          <line x1="14" y1="11" x2="14" y2="17"></line>
+        </svg>
+      `;
+      delBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        confirmDeleteMessage(msg.id);
+      });
+      row.appendChild(delBtn);
+
+      // Support mobile (appui long / touch)
+      let touchTimer = null;
+      wrapper.addEventListener('touchstart', () => {
+        touchTimer = setTimeout(() => {
+          wrapper.classList.toggle('show-actions');
+        }, 400);
+      }, { passive: true });
+      wrapper.addEventListener('touchend', () => {
+        clearTimeout(touchTimer);
+      });
+    }
+
+    wrapper.appendChild(row);
     chatMessages.appendChild(wrapper);
   }
 
   // --- Envoi de messages & Indicateurs d'écriture ---
 
-  // Gestion de la saisie pour l'indicateur "est en train d'écrire..."
   messageInput.addEventListener('input', () => {
     if (!activeContact || !socket) return;
 
@@ -685,7 +1078,6 @@
     }, 1500);
   });
 
-  // Soumission du formulaire d'envoi
   messageForm.addEventListener('submit', (e) => {
     e.preventDefault();
     if (!activeContact || !socket) return;
@@ -703,13 +1095,36 @@
     // Réinitialiser le champ texte
     messageInput.value = '';
 
-    // Émettre l'événement Socket.io
+    // 1. Affichage optimiste instantané
+    const tempId = `temp_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const optimisticMsg = {
+      id: tempId,
+      tempId: tempId,
+      sender_id: currentUser.id,
+      receiver_id: activeContact.id,
+      content: content,
+      is_read: 0,
+      is_deleted: 0,
+      is_optimistic: true,
+      created_at: new Date().toISOString()
+    };
+
+    appendMessageBubble(optimisticMsg);
+    scrollToBottom(true);
+    updateConversationWithNewMessage(optimisticMsg, activeContact.id, false);
+
+    // 2. Émission via Socket.io avec callback de confirmation
     socket.emit('send_message', {
       receiverId: activeContact.id,
-      content: content
+      content: content,
+      tempId: tempId
     }, (response) => {
       if (response && response.error) {
         alert(response.error);
+        const optBubble = document.querySelector(`.message-bubble-wrapper[data-msg-id="${tempId}"]`);
+        if (optBubble) optBubble.remove();
+      } else if (response && response.message) {
+        handleMessageConfirmation(response.message);
       }
     });
   });

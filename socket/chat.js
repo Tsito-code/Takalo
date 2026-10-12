@@ -1,7 +1,7 @@
 /**
  * Gestionnaire temps réel Socket.io
  * Gère la présence (en ligne/hors ligne), l'envoi/réception de messages,
- * les indicateurs d'écriture et les confirmations de lecture.
+ * les indicateurs d'écriture, les confirmations de lecture et la suppression en direct.
  */
 
 const db = require('../db');
@@ -18,7 +18,8 @@ function initSocket(io) {
     const user = socket.user;
     const userId = user.id;
 
-    // Rejoindre la salle personnelle de l'utilisateur pour cibler facilement les messages
+    // Rejoindre la salle personnelle de l'utilisateur (format 'user:<id>' et 'user_<id>')
+    socket.join(`user:${userId}`);
     socket.join(`user_${userId}`);
 
     // Gestion du statut en ligne
@@ -49,6 +50,7 @@ function initSocket(io) {
 
         const receiverId = parseInt(data.receiverId, 10);
         const rawContent = data.content;
+        const tempId = data.tempId || null;
 
         if (isNaN(receiverId) || receiverId <= 0 || receiverId === userId) {
           if (callback) callback({ error: 'Destinataire invalide.' });
@@ -82,18 +84,83 @@ function initSocket(io) {
         // Sauvegarde persistante en base de données SQLite (requête paramétrée)
         const savedMessage = db.saveMessage(userId, receiverId, content);
 
-        // Envoyer le message au destinataire s'il est connecté
-        io.to(`user_${receiverId}`).emit('new_message', savedMessage);
+        const payload = {
+          ...savedMessage,
+          sender_username: user.username,
+          tempId: tempId
+        };
 
-        // Répondre à l'expéditeur avec le message persisté (horodatage, id généré)
+        // Envoyer le message aux sockets du destinataire (salle dédiée)
+        io.to(`user:${receiverId}`).to(`user_${receiverId}`).emit('new_message', payload);
+
+        // Envoyer également aux autres onglets ouverts de l'expéditeur
+        socket.to(`user:${userId}`).to(`user_${userId}`).emit('message_sent', payload);
+
+        // Confirmer à l'expéditeur ayant émis le message
         if (callback) {
-          callback({ success: true, message: savedMessage });
+          callback({ success: true, message: payload, tempId: tempId });
         } else {
-          socket.emit('message_sent', savedMessage);
+          socket.emit('message_sent', payload);
         }
       } catch (err) {
         console.error('Erreur socket send_message :', err);
         if (callback) callback({ error: 'Erreur lors de l’envoi du message.' });
+      }
+    });
+
+    /**
+     * Suppression en temps réel de son propre message
+     */
+    socket.on('delete_message', (data, callback) => {
+      try {
+        if (!data || typeof data !== 'object') {
+          if (callback) callback({ error: 'Données invalides.' });
+          return;
+        }
+
+        const messageId = parseInt(data.messageId, 10);
+        if (isNaN(messageId) || messageId <= 0) {
+          if (callback) callback({ error: 'Identifiant invalide.' });
+          return;
+        }
+
+        const result = db.deleteMessage(messageId, userId);
+
+        if (result.error === 'NOT_FOUND') {
+          if (callback) callback({ error: 'Message introuvable.' });
+          return;
+        }
+
+        if (result.error === 'FORBIDDEN') {
+          if (callback) callback({ error: 'Vous ne pouvez supprimer que vos propres messages.' });
+          return;
+        }
+
+        if (result.error === 'ALREADY_DELETED') {
+          if (callback) callback({ error: 'Ce message a déjà été supprimé.' });
+          return;
+        }
+
+        const payload = {
+          id: result.message.id,
+          senderId: result.message.sender_id,
+          receiverId: result.message.receiver_id,
+          deletedAt: result.message.deleted_at
+        };
+
+        // Diffusion vers l'expéditeur et le destinataire (tous leurs onglets)
+        io.to(`user:${result.message.sender_id}`)
+          .to(`user:${result.message.receiver_id}`)
+          .to(`user_${result.message.sender_id}`)
+          .to(`user_${result.message.receiver_id}`)
+          .emit('message:deleted', payload);
+
+        if (callback) {
+          callback({ success: true, message: payload });
+        }
+      } catch (err) {
+        console.error('Erreur socket delete_message :', err);
+        if (callback) callback({ error: 'Erreur lors de la suppression.' });
       }
     });
 
@@ -105,7 +172,7 @@ function initSocket(io) {
       const receiverId = parseInt(data.receiverId, 10);
       if (isNaN(receiverId) || receiverId === userId) return;
 
-      io.to(`user_${receiverId}`).emit('user_typing', {
+      io.to(`user:${receiverId}`).to(`user_${receiverId}`).emit('user_typing', {
         senderId: userId,
         username: user.username
       });
@@ -119,7 +186,7 @@ function initSocket(io) {
       const receiverId = parseInt(data.receiverId, 10);
       if (isNaN(receiverId) || receiverId === userId) return;
 
-      io.to(`user_${receiverId}`).emit('user_stop_typing', {
+      io.to(`user:${receiverId}`).to(`user_${receiverId}`).emit('user_stop_typing', {
         senderId: userId
       });
     });
@@ -135,7 +202,7 @@ function initSocket(io) {
       const changes = db.markMessagesAsRead(otherSenderId, userId);
       if (changes > 0) {
         // Prévenir l'expéditeur d'origine que ses messages ont été lus
-        io.to(`user_${otherSenderId}`).emit('messages_read_by_recipient', {
+        io.to(`user:${otherSenderId}`).to(`user_${otherSenderId}`).emit('messages_read_by_recipient', {
           readerId: userId
         });
       }

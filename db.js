@@ -14,9 +14,6 @@ const db = new Database(path.resolve(__dirname, dbPath));
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
 
-/**
- * Initialisation des tables et des index
- */
 function initDatabase() {
   db.exec(`
     -- Table des utilisateurs
@@ -34,6 +31,8 @@ function initDatabase() {
       receiver_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       content TEXT NOT NULL,
       is_read INTEGER DEFAULT 0,
+      is_deleted INTEGER DEFAULT 0,
+      deleted_at DATETIME,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
 
@@ -47,6 +46,16 @@ function initDatabase() {
     CREATE INDEX IF NOT EXISTS idx_messages_created_at 
       ON messages(created_at);
   `);
+
+  // Migration dynamique pour ajouter is_deleted et deleted_at si la table existait déjà
+  const tableInfo = db.pragma('table_info(messages)');
+  const hasIsDeleted = tableInfo.some(col => col.name === 'is_deleted');
+  if (!hasIsDeleted) {
+    db.exec(`
+      ALTER TABLE messages ADD COLUMN is_deleted INTEGER DEFAULT 0;
+      ALTER TABLE messages ADD COLUMN deleted_at DATETIME;
+    `);
+  }
 }
 
 initDatabase();
@@ -87,34 +96,61 @@ const stmtListAllOtherUsers = db.prepare(`
 `);
 
 const stmtSaveMessage = db.prepare(`
-  INSERT INTO messages (sender_id, receiver_id, content, is_read) 
-  VALUES (?, ?, ?, 0)
+  INSERT INTO messages (sender_id, receiver_id, content, is_read, is_deleted) 
+  VALUES (?, ?, ?, 0, 0)
 `);
 
 const stmtGetMessageById = db.prepare(`
-  SELECT id, sender_id, receiver_id, content, is_read, created_at 
+  SELECT id, sender_id, receiver_id, 
+         CASE WHEN is_deleted = 1 THEN NULL ELSE content END AS content, 
+         is_read, is_deleted, deleted_at, created_at 
   FROM messages 
   WHERE id = ?
 `);
 
+const stmtGetRawMessageById = db.prepare(`
+  SELECT id, sender_id, receiver_id, content, is_read, is_deleted, deleted_at, created_at 
+  FROM messages 
+  WHERE id = ?
+`);
+
+const stmtDeleteMessage = db.prepare(`
+  UPDATE messages 
+  SET is_deleted = 1, deleted_at = CURRENT_TIMESTAMP 
+  WHERE id = ? AND sender_id = ? AND is_deleted = 0
+`);
+
 const stmtGetConversationMessages = db.prepare(`
-  SELECT id, sender_id, receiver_id, content, is_read, created_at 
+  SELECT id, sender_id, receiver_id, 
+         CASE WHEN is_deleted = 1 THEN NULL ELSE content END AS content, 
+         is_read, is_deleted, deleted_at, created_at 
   FROM messages 
   WHERE (sender_id = ? AND receiver_id = ?) 
      OR (sender_id = ? AND receiver_id = ?) 
   ORDER BY id ASC
 `);
 
+const stmtGetMissedMessages = db.prepare(`
+  SELECT m.id, m.sender_id, m.receiver_id, 
+         CASE WHEN m.is_deleted = 1 THEN NULL ELSE m.content END AS content, 
+         m.is_read, m.is_deleted, m.deleted_at, m.created_at,
+         u.username AS sender_username
+  FROM messages m
+  JOIN users u ON u.id = m.sender_id
+  WHERE (m.receiver_id = ? OR m.sender_id = ?) AND m.id > ?
+  ORDER BY m.id ASC
+`);
+
 const stmtMarkMessagesAsRead = db.prepare(`
   UPDATE messages 
   SET is_read = 1 
-  WHERE sender_id = ? AND receiver_id = ? AND is_read = 0
+  WHERE sender_id = ? AND receiver_id = ? AND is_read = 0 AND is_deleted = 0
 `);
 
 const stmtCountUnreadPerSender = db.prepare(`
   SELECT COUNT(*) as count 
   FROM messages 
-  WHERE receiver_id = ? AND sender_id = ? AND is_read = 0
+  WHERE receiver_id = ? AND sender_id = ? AND is_read = 0 AND is_deleted = 0
 `);
 
 const stmtGetUserConversations = db.prepare(`
@@ -123,8 +159,9 @@ const stmtGetUserConversations = db.prepare(`
       id,
       sender_id,
       receiver_id,
-      content,
+      CASE WHEN is_deleted = 1 THEN 'Ce message a été supprimé' ELSE content END AS content,
       is_read,
+      is_deleted,
       created_at,
       CASE 
         WHEN sender_id = ? THEN receiver_id 
@@ -140,7 +177,7 @@ const stmtGetUserConversations = db.prepare(`
   unread_counts AS (
     SELECT sender_id AS contact_id, COUNT(*) as unread_count
     FROM messages
-    WHERE receiver_id = ? AND is_read = 0
+    WHERE receiver_id = ? AND is_read = 0 AND is_deleted = 0
     GROUP BY sender_id
   )
   SELECT 
@@ -149,6 +186,7 @@ const stmtGetUserConversations = db.prepare(`
     rm.content AS last_message,
     rm.created_at AS last_message_time,
     rm.sender_id AS last_sender_id,
+    rm.is_deleted AS last_is_deleted,
     COALESCE(uc.unread_count, 0) AS unread_count
   FROM ranked_messages rm
   JOIN users u ON u.id = rm.contact_id
@@ -172,7 +210,26 @@ module.exports = {
     return stmtGetMessageById.get(info.lastInsertRowid);
   },
   getMessageById: (id) => stmtGetMessageById.get(id),
+  getRawMessageById: (id) => stmtGetRawMessageById.get(id),
+  deleteMessage: (messageId, userId) => {
+    const msg = stmtGetRawMessageById.get(messageId);
+    if (!msg) return { error: 'NOT_FOUND' };
+    if (msg.sender_id !== userId) return { error: 'FORBIDDEN' };
+    if (msg.is_deleted) return { error: 'ALREADY_DELETED' };
+    stmtDeleteMessage.run(messageId, userId);
+    return {
+      success: true,
+      message: {
+        id: messageId,
+        sender_id: msg.sender_id,
+        receiver_id: msg.receiver_id,
+        is_deleted: 1,
+        deleted_at: new Date().toISOString()
+      }
+    };
+  },
   getConversationMessages: (user1Id, user2Id) => stmtGetConversationMessages.all(user1Id, user2Id, user2Id, user1Id),
+  getMissedMessages: (userId, sinceId) => stmtGetMissedMessages.all(userId, userId, sinceId || 0),
   markMessagesAsRead: (senderId, receiverId) => {
     const info = stmtMarkMessagesAsRead.run(senderId, receiverId);
     return info.changes;

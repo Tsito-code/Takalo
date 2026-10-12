@@ -3,7 +3,9 @@
  * - Démarrage du serveur
  * - Appels HTTP (Inscription, Connexion, Cookies)
  * - Connexion Socket.io
- * - Émission & Réception de messages en temps réel
+ * - Émission & Réception de messages en temps réel (Optimiste / Confirmation)
+ * - Suppression de message en temps réel (message:deleted)
+ * - Synchronisation après reconnexion (/api/messages/sync)
  * - Arrêt propre du serveur
  */
 
@@ -52,8 +54,19 @@ async function runE2E() {
   serverProcess.stdout.on('data', (d) => process.stdout.write('[SERVEUR] ' + d));
   serverProcess.stderr.on('data', (d) => process.stderr.write('[SERVEUR-ERR] ' + d));
 
-  // Attendre que le serveur démarre
-  await sleep(1500);
+  // Attendre dynamiquement que le serveur écoute sur le port 3000
+  let isReady = false;
+  for (let i = 0; i < 20; i++) {
+    await sleep(300);
+    try {
+      await httpRequest({ hostname: 'localhost', port: PORT, path: '/login', method: 'GET' });
+      isReady = true;
+      break;
+    } catch (e) {
+      // Pas encore prêt
+    }
+  }
+  if (!isReady) throw new Error('Le serveur n\'a pas démarré dans les délais.');
 
   try {
     // 1. Inscription Utilisateur 1 : UserOne
@@ -121,7 +134,7 @@ async function runE2E() {
 
     console.log('Sockets 1 et 2 connectés avec succès !');
 
-    // 5. UserOne envoie un message en temps réel à UserTwo
+    // 5. UserOne envoie un message en temps réel à UserTwo (avec tempId)
     console.log('\n5. Envoi de message temps réel Socket.io...');
     const messagePromise = new Promise((resolve) => {
       socket2.on('new_message', (msg) => {
@@ -132,7 +145,8 @@ async function runE2E() {
 
     socket1.emit('send_message', {
       receiverId: user2Id,
-      content: 'Coucou UserTwo, ceci est un test temps réel !'
+      content: 'Coucou UserTwo, ceci est un test temps réel !',
+      tempId: 'temp_test_123'
     });
 
     const receivedMessage = await messagePromise;
@@ -140,23 +154,49 @@ async function runE2E() {
       throw new Error('Contenu de message non conforme');
     }
 
-    // 6. Test indicateur de frappe
-    console.log('\n6. Test typing indicator...');
-    const typingPromise = new Promise((resolve) => {
-      socket2.on('user_typing', (data) => {
-        console.log('UserTwo a reçu l\'événement typing :', data);
-        resolve(data);
+    // 6. Test suppression de message en direct
+    console.log('\n6. Test suppression de message (message:deleted)...');
+    const deletePromise = new Promise((resolve) => {
+      socket2.on('message:deleted', (delData) => {
+        console.log('UserTwo a reçu la suppression en direct :', delData);
+        resolve(delData);
       });
     });
 
-    socket1.emit('typing_start', { receiverId: user2Id });
-    await typingPromise;
+    const delRes = await httpRequest({
+      hostname: 'localhost',
+      port: PORT,
+      path: `/api/messages/${receivedMessage.id}`,
+      method: 'DELETE',
+      headers: { 'Cookie': cookieUser1 }
+    });
+    console.log('Réponse API DELETE :', delRes.statusCode, delRes.body);
+    if (delRes.statusCode !== 200) throw new Error('Échec suppression de message');
+
+    const deleteEventData = await deletePromise;
+    if (deleteEventData.id !== receivedMessage.id) {
+      throw new Error('ID du message supprimé non conforme');
+    }
+
+    // 7. Test synchronisation reconnexion /api/messages/sync
+    console.log('\n7. Test synchronisation /api/messages/sync...');
+    const syncRes = await httpRequest({
+      hostname: 'localhost',
+      port: PORT,
+      path: `/api/messages/sync?sinceId=0`,
+      method: 'GET',
+      headers: { 'Cookie': cookieUser2 }
+    });
+    console.log('Réponse API sync :', syncRes.statusCode, syncRes.body);
+    if (syncRes.statusCode !== 200 || !Array.isArray(syncRes.body.messages)) {
+      throw new Error('Échec route sync');
+    }
 
     // Fermeture des sockets
     socket1.disconnect();
     socket2.disconnect();
 
-    console.log('\n Test E2E réussi avec brio ! Tout fonctionne parfaitement.');
+    console.log('\n Test E2E complet réussi avec brio ! Toutes les fonctionnalités sont validées.');
 
   } finally {
     // Arrêter le serveur

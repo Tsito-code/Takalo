@@ -4,9 +4,15 @@ package-lock.json
 
 # Fichiers de données et bases de données SQLite
 *.sqlite
+*.sqlite3
 *.sqlite-wal
 *.sqlite-shm
 *.db
+
+# Fichiers temporaires et exports
+conversation.json
+transcript.json
+export_json.js
 
 # Variables d'environnement locales sensibles
 .env
